@@ -91,13 +91,16 @@ Each connector exposes the same shape to the orchestrator. The orchestrator neve
 
 ## Components (online serving path — the demo)
 
-### 1. Producer
+### 1. Producer / Load generator
 
-- Reads a DS2 record from disk (`.dat` + `.atr` via `wfdb`).
-- Walks the signal sample-by-sample, maintaining simulated wall-clock.
+- Runs as a **Kubernetes Job** launched via `scripts/loadgen.sh`. Not a laptop-side script.
+- Each pod spawns K async producer tasks, one per **virtual patient**.
+- Each producer task reads a DS2 record from disk (baked into the image for V1) and walks through its beats in order.
+- **Staggered start offsets** across copies of the same record prevent lockstep emission.
 - At each annotated R-peak, extracts a beat-centered window + metadata.
 - Publishes to Redis stream `pulsegate:beats:in`.
-- Configurable playback rate: 1x (real-time), 10x, 100x for load testing.
+- Knobs exposed via env vars: `RECORDS`, `COPIES_PER_RECORD`, `SPEED`, `DURATION`.
+- Scale levers: **record variety** (22 real DS2) × **virtual-patient fan-out** (copies per record) × **playback speed** (Nx). See design-notes §6 for the throughput math and design-notes §7 for the K8s deployment shape.
 
 **Message shape (draft):**
 ```json

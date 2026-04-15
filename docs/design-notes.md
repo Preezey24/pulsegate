@@ -181,7 +181,125 @@ Every stream message gains a `signal_type` field (`"ecg_beat"` | `"pcg_recording
 
 ---
 
-## 6. Training infra vs. serving infra — shared code, separate runtime
+## 6. Load simulation strategy — real data, fanned out and accelerated
+
+**Decision:** No synthetic ECG. Generate load by replaying the 22 real DS2 records through many concurrent producer workers, each representing one "virtual patient." Three levers stack:
+
+1. **Record variety** — 22 real DS2 records are the base set of distinct signal sources.
+2. **Virtual-patient fan-out** — each record is replayed N times concurrently, with **staggered start offsets** so the N copies aren't in lockstep (e.g. copy 1 at beat 0, copy 2 at beat 300, copy 3 at beat 600). Each copy traverses its record sequentially; variety at the message level comes from the copies being at different points in the recording at any given moment.
+3. **Playback speed (Nx)** — each replay emits beats at Nx the natural heart rate.
+
+**Why real data, not synthetic:**
+- Real data has genuine beat-morphology variety the model was trained on. Synthetic signals would either be trivial (the model aces them) or adversarial (the model fails in uninteresting ways) — neither useful for load testing.
+- Using real DS2 means the same bytes that the offline eval harness scores against are what's flowing through Redis. Enables online/offline parity testing (see §6 in architecture.md).
+
+**Why sequential-within-stream:**
+Inter-beat intervals matter clinically and are a feature used by some classifiers. Shuffling beats within a record would destroy that signal and produce unrealistic sequences.
+
+**Why staggered offsets across copies:**
+If all 10 copies of record 100 start at beat 0 simultaneously, they emit identical messages in lockstep — volume without variety. Staggering means the 10 copies are each at a different point in the recording at any moment → 10 different beats in flight.
+
+**Circular replay (wrap-around):**
+Each producer plays its record beats in order from its `start_offset`, wraps past the last beat back to beat 0, and continues to `start_offset - 1` — then loops again. Two reasons:
+- No signal variety is lost (beats before the offset still get played).
+- A 30-min record at 100x finishes in ~18s; without looping, producers would go idle almost immediately. Loop-around sustains load for multi-minute tests.
+
+**Wrap-point caveat:** at the wrap boundary, the last beat of the recording and the first beat aren't adjacent in real time, so inter-beat intervals across the seam are meaningless. Beat-level classification doesn't care (each beat is classified independently). But if a future **rhythm-level** connector (PCG or AFib) uses windows that span the seam, those windows should be tagged so the scorer excludes them.
+
+**Throughput math (back-of-envelope):**
+
+Each DS2 record has ~2,000-3,000 beats over 30 minutes (60-90 bpm × 30 min). At 1x playback each stream emits ~1-1.5 beats/sec. Fan-out and speed multiply this:
+
+| Setup | Streams | Per-stream rate | Total msg/sec |
+|---|---|---|---|
+| 22 records × 1x | 22 | ~1/sec | ~22 |
+| 22 × 10 copies × 100x | 220 | ~100/sec | ~22,000 |
+| 22 × 100 copies × 100x | 2,200 | ~100/sec | ~220,000 |
+
+**Realism-vs-volume trade:**
+Pure duplicates (same record, no perturbation) are fine for measuring infra throughput and latency — the model doesn't care. For robustness testing later, add small per-copy noise or timing jitter to prevent identical payloads. Park as a stretch.
+
+**Producer worker contract (sketch):**
+```python
+async def producer(record_id, virtual_patient_id, start_offset, speed):
+    for beat_window, annotation in replay(record_id, start=start_offset, speed=speed):
+        await redis.xadd("pulsegate:beats:in", {
+            "signal_type": "ecg_beat",
+            "virtual_patient_id": virtual_patient_id,  # disambiguates shared record replays
+            "record_id": record_id,
+            "samples": beat_window,
+            "ground_truth": annotation,
+            "producer_ts": time.time(),
+        })
+```
+
+`virtual_patient_id` is essential — without it, the scorer can't tell two virtual patients apart when they replay the same underlying record.
+
+---
+
+## 7. Load generator runs as a K8s workload
+
+**Decision:** The load generator is a **Kubernetes Job** (or Deployment with replicas), driven by a bash/CLI script that spins it up on demand. It emits messages into the same Redis stream the production path reads from.
+
+**Why a K8s workload and not a local script:**
+- Mirrors production load-testing patterns — load generation needs to be horizontally scalable too.
+- Decouples load volume from the developer laptop: `kubectl scale` to ramp up.
+- Demonstrates end-to-end K8s-native operation: producer pods, consumer pods, Redis, all in the cluster.
+- CV bullet: *"Kubernetes-native load-generation harness for streaming classification service."*
+
+**Shape:**
+
+```
+ ┌────────────────────┐
+ │ bash: loadgen.sh   │  → kubectl apply + env-var knobs
+ │  --records=22      │    (records, copies, speed, duration)
+ │  --copies=10       │
+ │  --speed=100       │
+ └─────────┬──────────┘
+           │
+           ▼
+ ┌─────────────────────────────┐
+ │ K8s Job: pulsegate-loadgen  │
+ │  - N replica pods           │
+ │  - each pod runs K          │
+ │    producer async tasks     │
+ │  - total virtual patients   │
+ │    = N × K                  │
+ └─────────┬───────────────────┘
+           │ xadd
+           ▼
+ ┌─────────────────────────────┐
+ │   Redis: pulsegate:beats:in │
+ └─────────┬───────────────────┘
+           │
+           ▼
+     consumer pods → orchestrator → connector → model
+```
+
+**Operator experience:**
+```
+./scripts/loadgen.sh --copies=10 --speed=100 --duration=5m
+```
+The script builds (or assumes pre-built) a `pulsegate-loadgen` image, renders a Job manifest with the knobs as env vars, applies it, and tails logs. Teardown is either automatic (Job completion) or explicit `kubectl delete job pulsegate-loadgen`.
+
+**What the pod does on start:**
+1. Reads env vars for record set, copies, speed, duration.
+2. Loads DS2 records from a PVC or S3-like blob (baked into the image for V1 — MIT-BIH is small).
+3. Spawns producer async tasks with staggered start offsets.
+4. Streams beats to `pulsegate:beats:in` until duration elapses or the pod is killed.
+
+**Why this matters architecturally:**
+- The load generator becomes part of the deployable system, not a shell script on the dev's laptop.
+- Observability is unified — producer metrics (send rate, drops) come through the same Prometheus pipeline as consumer metrics.
+- Pod count, replica scale, and per-pod concurrency become the load-testing knobs.
+
+**Scope discipline:**
+- V1: single Job, configured by env vars, one bash script to launch it. No operator, no CRD, no autoscaling.
+- Stretch: HPA on consumer queue depth; separate load-shape profiles (spike, ramp, sustained).
+
+---
+
+## 8. Training infra vs. serving infra — shared code, separate runtime
 
 **Decision:** Three runtime paths, one shared feature/windowing library:
 
