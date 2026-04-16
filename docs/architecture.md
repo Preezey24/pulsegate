@@ -190,12 +190,20 @@ Connector-specific fields live alongside the common fields. The Gateway only rea
 - Updates running per-class confusion matrix, exposed as Prometheus counters.
 - In production (no ground truth in the message), the scorer is either omitted or runs as a shadow job against a held-out dataset.
 
-### 4. Observability
+### 4. Sampler (stretch — Week 4 if bandwidth allows)
+
+- Separate Deployment with its own Redis consumer group on `:out` streams. Independent of the Gateway correlator (Redis Streams supports multiple consumer groups on the same stream).
+- For each message, decides whether to sample based on layered strategy: uniform rate (V1 stretch: 1%) plus future per-class quotas + low-confidence triggers.
+- Writes sampled records (input + prediction + confidence + model_version + sampling reason) to object storage (MinIO in-cluster for V1; S3/GCS for cloud deploys) as JSONL partitioned by date and signal type.
+- Human reviewers download batches periodically; their re-labels feed back into the eval set or retraining corpus.
+- See design-notes §10 for the full strategy.
+
+### 5. Observability
 
 - **Prometheus metrics** — throughput (msg/s), latency histogram (p50/p95/p99), per-class prediction counts, per-class TP/FP/FN, model load time, queue depth.
 - **Grafana dashboard** — panels for each of the above, screenshots go in README.
 
-### 5. K8s wrapper (Week 3)
+### 6. K8s wrapper (Week 3)
 
 - Deployment for the inference worker.
 - Service + Ingress for FastAPI.
@@ -250,10 +258,12 @@ Any divergence is a bug in the serving path (windowing difference, feature drift
 
 - **Backpressure strategy** when consumer falls behind producer — drop, buffer, shed? (Week 2 task.)
 - **Sharding activation** — V1 ships 1 shard per `:in` stream. What measured throughput triggers turning on sharded streams by `hash(virtual_patient_id)`?
+- **Gateway XREAD ceiling** — single XREAD BLOCK coroutine per Gateway pod reads all `:out` streams. Bottlenecks at ~100k msg/sec (Python parsing + dict lookup CPU). Mitigation path: partition XREAD per signal type, then shard `:out` by `hash(request_id)`, then dedicated correlator + pub/sub fanout.
 - **Model versioning** — how does a new model artifact roll out? Blue/green via separate worker Deployments + Gateway routing rules? Shadow traffic?
 - **Gateway scale-out** — each gateway pod holds its own `request_id → future` map. If ingress sticky-sessions break, a response could arrive at a different pod than the one holding the caller. Solvable via Redis pub/sub fanout of responses to all gateway pods, or by making the gateway strictly sticky.
 - **Secrets / config** — where do model paths, Redis URLs, thresholds live? (ConfigMap + env vars, probably.)
 - **Artifact storage** — git-lfs? S3-like blob? For V1, local filesystem is fine.
+- **Sampler retention + reviewer access** (stretch dependency) — how long do we keep sampled records, and how do reviewers get them? V1 stretch: hourly JSONL files in MinIO, 30-day retention, manual download via `mc cp`. Web UI for reviewers is post-stretch.
 
 ---
 

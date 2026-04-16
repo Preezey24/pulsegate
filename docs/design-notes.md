@@ -432,6 +432,30 @@ Rule: `consumers_in_group ≤ shard_count`, practically `= shard_count`. Shards 
 
 **Shard count is a topology constant.** Changing N at runtime reshuffles the patient→shard map and two consumers could transiently hold different context for the same patient. Treat shard count as changed only via planned maintenance (drain, reconfigure, restart).
 
+**Where each invariant is enforced:**
+
+| Invariant | Enforced by |
+|---|---|
+| 1. One producer per patient | Virtual-patient-ID space partitioned across load-gen pods at startup. |
+| 2. Monotonic stream IDs | Redis server (data-structure guarantee). |
+| 3. XREADGROUP in stream-ID order | Redis server (delivery guarantee). |
+| 4. Sequential await in consumer loop | **Code discipline.** Most fragile link — a single `asyncio.create_task` instead of `await` breaks it. |
+| 5. One consumer per shard | Consumer-group config + deployment review. |
+| Shard ownership stable per patient | Sharding hash + shard count held constant. |
+| No thread races within a coroutine | asyncio is single-threaded — only one coroutine runs at a time, switching at `await` points. |
+
+**Invariant 4 is the fragile link.** Sharding handles cross-coroutine isolation (one coroutine ever owns patient 42). asyncio's single-threaded model handles thread races. But within a coroutine, if a developer fires `create_task` instead of `await`-ing, beats race on the cache:
+- Beat 1 reads cache `[history A]`, starts inference.
+- Beat 2 reads cache `[history A]` (Beat 1 hasn't updated it yet), starts inference.
+- Beat 1 finishes, writes `[history A + beat 1]`.
+- Beat 2 finishes, overwrites with `[history A + beat 2]` — **beat 1 is lost from the cache**, and beat 2 was scored without it in context.
+
+**Guardrails for invariant 4:**
+
+1. **Integration test (write once, runs forever):** producer emits N beats per patient with monotonic sequence numbers in the payload. Test asserts the response stream contains responses for that patient in monotonic sequence order. Catches accidental `create_task` regression in code review or CI.
+2. **Code-review checklist item:** consumer message-handling uses `await`, never `create_task` in the per-shard loop. A grep for `create_task(process` in worker code is the lint.
+3. **Architecture invariant in this doc:** reviewers can point at the chain above when reviewing PRs that touch the consumer loop.
+
 ### Response routing across multiple Gateway pods
 
 **Problem:** with N Gateway pods, a response on `:out` could be consumed by any pod, but only the pod holding the caller's HTTP connection (and the `pending[request_id]` future) can resolve it.
@@ -608,3 +632,104 @@ All three import the **same windowing/feature code** from a shared `pulsegate-co
 
 **Bonus property this buys us:**
 - Online/offline parity testing — running DS2 through both paths should produce identical predictions. Any divergence is a bug in the serving path.
+
+---
+
+## 10. Result sampling for human review (stretch)
+
+**Decision (stretch goal):** A configurable percentage of production predictions are written to durable storage along with their inputs, for periodic human review. Reviewers download samples, score them against their own judgement, and the resulting labels feed back into the eval harness or retraining set.
+
+**Why:**
+- **Drift detection:** the model was tuned on DS2. Production input distribution may shift over time (different demographics, different recording equipment, etc.). Without sampling, drift is invisible until macro-F1 collapses.
+- **Edge-case discovery:** rare arrhythmias and ambiguous beats are exactly what the model handles worst. Sampling surfaces them for retraining.
+- **Regulated-context posture:** medical-adjacent systems are expected to maintain audit trails. Even a portfolio project benefits from showing this discipline.
+- **Continuous-improvement flywheel:** sampled-and-relabeled data → next eval set → next training corpus → next model version.
+
+### Architecture
+
+A separate **Sampler** Deployment with its own consumer group on `:out` streams. Decoupled from Gateway response correlation.
+
+```
+ecg:out ──┬──→ Gateway response correlator (consumer group: gateway)
+          │
+          └──→ Sampler                       (consumer group: sampler)
+                 │
+                 ▼  with probability p, plus stratified rules
+               Object storage (S3-like blob)
+                 │
+                 ▼
+               Human reviewers download CSV / JSONL batches
+```
+
+- **Distinct consumer group** so the Sampler reads independently of the Gateway. Two groups on the same stream get the same messages — this is exactly how Redis Streams supports fan-out subscribers without interfering with each other.
+- **Sampler is stateless** apart from rate-limiting / quota counters; restartable.
+
+### Sampling strategy — uniform isn't enough
+
+A naive 1% uniform sample is mostly N beats (~90% of the dataset). Reviewers spend their time looking at boring cases.
+
+**Recommended layered strategy (when implemented):**
+
+| Source | Rate | Why |
+|---|---|---|
+| Uniform | 0.5% | Captures the baseline distribution; cheap insurance against missing things. |
+| Per-class quotas | Up to N samples per class per hour | Guarantees minimum visibility into rare classes (V, F, S). |
+| Low-confidence | All predictions with `confidence < 0.7` | Most informative for retraining; model is uncertain → human label disambiguates. |
+| Disagreement (if multi-model) | All cases where model A and model B disagree | Stretch-of-stretch; only meaningful in shadow-traffic A/B setups. |
+
+V1 stretch (when we get there): start with **uniform 1%** for simplicity; add stratification later.
+
+### Storage choice
+
+| Option | When to pick |
+|---|---|
+| **Object storage (S3 / GCS / MinIO)** | Default. Append-only, cheap, easy to download bulk. JSONL or Parquet files partitioned by date. |
+| **Postgres** | Pick if reviewers need queries (e.g. "show me all V-predictions with confidence < 0.6 from this week"). Adds ops cost. |
+| **PVC + flat file** | Local-cluster demo only. Fine for V1 stretch; not for any real deployment. |
+
+For pulsegate stretch: MinIO running in-cluster (same image semantics as S3, runs anywhere), JSONL files partitioned by date and signal type. Reviewers download via `mc cp` or a small web UI.
+
+### Sample record shape
+
+Each sampled message stored with everything needed for a human to re-evaluate:
+
+```json
+{
+  "sampled_at": "2026-04-16T09:42:13Z",
+  "request_id": "uuid-xyz",
+  "signal_type": "ecg_beat",
+  "virtual_patient_id": "42",
+  "input": {
+    "samples": [...],          // original 250 floats
+    "metadata": { ... }        // record_id, beat_index, etc.
+  },
+  "prediction": "V",
+  "confidence": 0.62,
+  "model_version": "v3.2",
+  "sample_reason": "low_confidence"   // uniform | quota | low_confidence
+}
+```
+
+Including `model_version` is critical — when a sample is reviewed weeks later, you need to know which model produced it.
+
+### Scope discipline
+
+V1 stretch (only if Week 4 has bandwidth):
+- Sampler Deployment + consumer group on `ecg:out`.
+- Uniform 1% sampling.
+- JSONL append to a PVC, hourly file rotation.
+- A `scripts/download_samples.sh` that copies files for review.
+
+**Out of scope** for the stretch:
+- Web UI for reviewers (download to spreadsheet is fine V1).
+- Live re-labeling feedback loop.
+- Cross-model disagreement sampling.
+- Stratification beyond uniform.
+
+Adding the full strategy table above to the doc *before* implementing locks in the design language; only the simplest layer ships V1.
+
+### CV bullet
+
+*"Production result-sampling pipeline with stratified quotas for human-in-the-loop model review — feeds drift-detection and continuous re-evaluation flywheel."*
+
+(Truthful even if only the uniform-sampling layer ships, because the design captures the rest as planned extension.)
