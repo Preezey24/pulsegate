@@ -1,0 +1,10 @@
+[project]
+name = "pulsegate"
+version = "0.1.0"
+description = "Real-time biosignal classification platform — streaming infra, golden-dataset eval, multi-connector orchestration."
+requires-python = ">=3.12"
+dependencies = [
+    "matplotlib>=3.10.8",
+    "numpy>=2.4.4",
+    "wfdb>=4.3.1",
+]

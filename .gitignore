@@ -33,7 +33,6 @@ ENV/
 
 # Package managers
 .uv/
-uv.lock
 
 # Testing / coverage
 .pytest_cache/
