@@ -18,11 +18,11 @@ This document captures the dataset facts the pulsegate architecture depends on. 
 
 - **Sampling rate:** **360 Hz** per channel. (Confirmed across records 100, 102, 203, 232.)
 - **Number of channels:** **2** (simultaneous two-lead recording).
-- **Lead configuration:** typically **MLII on channel 0** + a precordial lead (V1, V2, V5, etc.) on channel 1. Per-record variation — see §9.
+- **Lead configuration:** typically **MLII on channel 0** + a precordial lead (V1, V2, V5, etc.) on channel 1. Per-record variation — see §10.
 - **ADC resolution:** 11-bit over 10 mV range → ~5 µV per ADC step. The smallest signal change the equipment can represent.
-- **Stored as:** float64 in memory (after `wfdb`'s int → mV conversion). Architecture casts to **float32 for transport** — float32's quantization (~0.1 µV) is ~50× finer than the underlying ADC resolution, so no information loss.
+- **Stored as:** float64 in memory (after `wfdb`'s int → mV conversion). Architecture casts to **float32 for transport** — float32 quantization at this voltage range is orders of magnitude finer than the ADC step (5 µV), so no information loss.
 - **Voltage range observed:** roughly ±1 to ±4 mV, varies significantly per patient (record 100 std 0.19 mV vs record 203 std 0.50 mV — 2.6× variability).
-- **Duration per record:** 30 minutes (650,000 samples = 1,805.6 s).
+- **Duration per record:** ~30 minutes (650,000 samples ÷ 360 Hz = 1,805.6 s ≈ 30:05).
 - **Total records:** **48**.
 - **Subjects:** 47 (one subject contributed two recordings).
 - **Recording era:** 1975-1979, ambulatory Holter tapes from Beth Israel Hospital.
@@ -102,7 +102,7 @@ MIT-BIH is overwhelmingly N. Per-record class distribution varies wildly:
 |---|---|---|
 | 100 | 98.5% | 1.5% S |
 | 203 | 81% N | 14% V, plus rare F, Q, S |
-| 232 | ~98% N (counting `R` as N) | 76% of all beats are `A` (S-class) — exception case |
+| 232 | 22% N (all `R`) | 78% `A` (S-class) — the A-dominant exception record |
 
 Implication: **per-class F1 metric is mandatory.** Overall accuracy would mask catastrophic failure on rare classes.
 
@@ -130,15 +130,68 @@ For internal model selection, hold out a few DS1 records as a validation set. De
 
 ## 7. Windowing decisions (architecture-relevant)
 
-- **Classification unit:** **per-beat**, not per-window.
-- **Window size:** ~250 ms before R-peak + ~450 ms after R-peak = ~700 ms total.
-- **At 360 Hz:** ~250 samples per window. Refine after testing on real R-peak placements.
+- **Classification unit:** **per-beat**, not per-window. One window → one label for the anchor beat only.
+- **Window size:** ~250 ms before R-peak + ~450 ms after R-peak = ~700 ms total (~252 samples at 360 Hz). Asymmetry is driven by ECG physiology: less signal of interest before the R-peak (P-wave, PR interval), more after (QRS tail + T-wave, which is diagnostically important for V-class detection).
+- **Window is fixed-size**, regardless of patient HR or R-R interval. R-peak always sits at sample **index 90** of the 252-sample window by construction (slice `signal[r_peak - 90 : r_peak + 162]`). The model always receives a fixed-shape input tensor.
+- **Consequence at high HR** (R-R < 700 ms, > ~86 bpm): consecutive windows **overlap** in raw-signal space — the same raw samples feed into multiple windows. Fine; each window is processed independently. Empirically, 31% of beats in record 203 have the next R-peak *inside* the current window — and this is diagnostic signal, since V-runs and premature beats are precisely the clinically important cases that cluster tightly.
+- **Consequence at low HR** (R-R > 700 ms, < ~86 bpm): a **gap** of (R-R − 700 ms) samples sits between consecutive windows and is never fed to the model. Dropped samples are almost entirely iso-electric baseline — low-information loss. Timing info from the gap is recovered separately via engineered temporal features (§8).
 - **Window stride:** N/A — windows are R-peak-anchored, one per beat annotation.
-- **R-peak alignment:** required. Use the annotation's sample index as the R-peak.
+- **R-peak alignment:** required. Use the annotation's sample index as the R-peak (by MIT-BIH convention, beat annotations are placed on the R-peak sample).
 - **Record boundaries:** for the first/last few beats of a record, windows may extend past the recording; pad with edge value or skip those beats.
-- **Pre-processing:** **per-beat z-score normalization** (`(window - mean) / std`) to make the model invariant to per-patient voltage scale. Confirmed necessary by the wide voltage-range variation across records.
+- **Pre-processing:** **per-beat z-score normalization** (`(window - mean) / std`) applied *after* windowing, *before* the model. Scope is per-beat (not per-record, not per-patient): each window becomes zero-mean, unit-std, so the model learns **morphology**, not absolute voltage. Confirmed necessary by the 2-3× voltage-range variation across records.
 
-## 8. Stream message shape (architecture-relevant)
+Pipeline (per beat):
+
+```
+Raw signal (p_signal, float64, mV)
+  → Extract window (252 samples around R-peak)
+  → Per-beat z-score: (window - window.mean()) / window.std()
+  → Cast to float32 for transport
+  → Model input
+```
+
+## 8. Engineered temporal features (architecture-relevant)
+
+Per-beat **timing scalars** computed by arithmetic on the `annotation.sample` array. Fed to the model as additional inputs alongside the 252-sample window. Hand-crafted, not learned — we give the model direct access to timing info that would otherwise only be implicit (or invisible) in the window morphology.
+
+### Why we need these
+
+Morphology alone is insufficient. Two beats with nearly identical waveforms can represent different clinical events depending on **when** they fire. Example: a ventricular-shaped beat arriving **300 ms** after the previous beat is a **premature ventricular contraction** (early — V-class, clinically urgent); the same waveform arriving **900 ms** later is a **ventricular escape beat** (late — the heart's natural pacemaker failed). Same shape, different diagnosis. Only the R-R timing distinguishes them.
+
+### Canonical feature set (Chazal et al. 2004)
+
+Four scalars per beat:
+
+| Feature | Formula | Captures |
+|---|---|---|
+| **pre_RR** | `(current_R − prev_R) / fs` | Time since previous beat — "was this beat early or on time?" |
+| **post_RR** | `(next_R − current_R) / fs` | Time until next beat — detects the compensatory pause after a premature beat |
+| **local_avg_RR** | `mean(last 10 R-R intervals)` | Patient's current baseline rhythm (HR context for normalization) |
+| **rr_ratio** | `pre_RR / local_avg_RR` | Prematurity normalised per patient (short vs. short-for-this-patient) |
+
+All computed from the `annotation.sample` integer array — trivial subtract-and-divide, no signal processing.
+
+### Coverage
+
+- **Long pauses** (e.g. record 232's 5.87 s gap between two beats) are **only** visible through R-R features — the 700 ms window can't span that far. Without R-R features, pathological pauses are invisible to the model.
+- **First beat** of any record: no previous R-peak → `pre_RR` and `rr_ratio` unavailable. Drop or impute from `local_avg_RR`.
+- **Last beat** of any record: no next R-peak → `post_RR` unavailable. Drop or skip.
+
+### Streaming constraint (architecture-relevant)
+
+In the serving path, the **next** R-peak isn't known at the moment we classify the current beat. Two options:
+
+1. **Latency-first:** compute only `pre_RR`, `local_avg_RR`, `rr_ratio` live; skip `post_RR`. Small accuracy cost.
+2. **Accuracy-first:** delay classification by one beat — always wait for the next R-peak. Adds one R-R interval (~500-1000 ms) of latency.
+
+V1 choice deferred to Week 2 serving work — likely (1) for the live endpoint, (2) for offline golden-dataset eval where latency is irrelevant.
+
+### How features reach the model
+
+- **Baseline (Week 1, sklearn):** per-beat feature vector = 4 temporal scalars + window summary stats (min, max, mean, std, a few FFT bins). RandomForest or GradientBoosting on top.
+- **CNN (Week 3):** 1D-CNN over the 252-sample window extracts morphology features; the 4 temporal scalars concatenated onto the CNN's output just before the final dense classifier head. Two-input model, one output.
+
+## 9. Stream message shape (architecture-relevant)
 
 ```json
 {
@@ -149,16 +202,21 @@ For internal model selection, hold out a few DS1 records as a validation set. De
   "beat_index": 1423,
   "r_peak_sample": 512340,
   "samples": [float32, ...],
+  "pre_rr": 0.823,
+  "post_rr": 0.791,
+  "local_avg_rr": 0.805,
+  "rr_ratio": 1.022,
   "ground_truth": "N",
   "producer_ts": 1234567890.123
 }
 ```
 
-- **Payload size:** ~250 floats × 4 bytes (float32) = **~1 KB samples** + ~100 B metadata = **~1.1 KB per beat message**.
+- **Payload size:** ~250 floats × 4 bytes (float32) = ~1 KB samples + 4 temporal scalars (~16 B) + ~100 B metadata = **~1.1 KB per beat message**.
 - **Beat rate per virtual patient at 1× playback:** ~1-1.5 msg/sec (matches natural heart rate).
 - **Throughput at load-test setting** (22 records × 10 virtual-patient copies × 100× speed) ≈ **~22,000 msg/sec**.
+- **Live-path caveat:** `post_rr` is only populated in the offline/replay path where the next beat is already known. Live serving either omits it or introduces a one-beat delay (see §8 streaming constraint).
 
-## 9. Known gotchas
+## 10. Known gotchas
 
 - **Records to exclude (AAMI EC57):** 102, 104, 107, 217 (paced beats). Confirmed via record 102 (92.5% `/` annotations).
 - **Records lacking MLII on channel 0:** at least 102 (V5/V2 instead) and 104 (V5/V2). Required handling: select MLII channel by name from `record.sig_name`, not by index.
@@ -167,7 +225,7 @@ For internal model selection, hold out a few DS1 records as a validation set. De
 - **Long pauses exist in real data:** record 232 has a 5.87s gap between two annotations — likely a real pathological pause (sinus arrest), not data corruption. Don't filter these out as outliers.
 - **Voltage scale varies 2-3× across patients** — per-beat normalization required.
 
-## 10. Open questions
+## 11. Open questions
 
 - **Exact window size in samples** — start with ~250 (250 ms before + 450 ms after at 360 Hz), but verify R-peak placement on real beats first. Some literature uses different splits (e.g. 100 ms before + 150 ms after). Refine after first model training.
 - **Per-record val split within DS1** — defer to training-script time. Likely 4-5 records held out, or k-fold within DS1.
