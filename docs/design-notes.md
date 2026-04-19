@@ -733,3 +733,52 @@ Adding the full strategy table above to the doc *before* implementing locks in t
 *"Production result-sampling pipeline with stratified quotas for human-in-the-loop model review — feeds drift-detection and continuous re-evaluation flywheel."*
 
 (Truthful even if only the uniform-sampling layer ships, because the design captures the rest as planned extension.)
+
+## 11. Memory footprint and data lifecycle
+
+`pulsegate_core.io.load_record` is a **boundary function**: it exists at the edge of the system where on-disk WFDB data crosses into in-memory form. Every downstream module consumes smaller, windowed representations — the raw signal is transient.
+
+### Per-record lifecycle (offline path)
+
+```
+load_record("100")                            ~10.4 MB in RAM (raw signal + annotations)
+  → filter non-beat annotations               still ~10.4 MB
+  → for each beat:
+      extract 252-sample window               + ~1 KB per beat (float32)
+      compute R-R temporal features           + ~32 bytes per beat
+  → collect into windowed cache               ~2 MB per record (~2,000 beats × 252 × 4 bytes)
+  → drop raw signal (let GC reclaim)          back down to ~2 MB
+```
+
+Per-record raw footprint: **~10.4 MB** (650,000 samples × 2 channels × float64). Windowed footprint after discarding raw: **~2 MB per record** — a **5× reduction**. All of DS2 pre-windowed fits in ~44 MB.
+
+### Footprint at each scale
+
+| Scenario | Raw in RAM | Notes |
+|---|---|---|
+| One record loaded | ~10.4 MB | Transient during windowing |
+| Full DS1 (22 records, training) | ~230 MB | If kept warm; not required |
+| Full DS2 (22 records, eval) | ~230 MB | Same |
+| Naive load-gen (22 × 10 virtual patients) | ~2.3 GB | **Avoided** — virtual patients share source records, see below |
+| Deduplicated load-gen | ~230 MB | 22 records × 1 copy, virtual patients = staggered offsets + different IDs |
+| Pre-windowed load-gen (DS2) | ~44 MB | Raw signal dropped; only windows + R-peak indices kept |
+
+### Rule: iterate, don't bulk-load
+
+Both training and eval paths are **iterators** over records, not bulk loads. Peak memory during any pass is `(raw of current record) + (accumulated windows so far)` — never `N × raw`. The pipeline function (`pulsegate_core.pipeline.iter_beats`) is the canonical form: it yields one windowed beat at a time, lets the caller decide whether to accumulate into a cache, stream to Redis, or hand straight to a model. The raw signal lives only inside the iterator's scope and is garbage-collected when the iterator finishes.
+
+### Where each path consumes the cache
+
+- **Training (Week 1):** the windowed cache is the X matrix; R-R scalars are additional feature columns; labels come from `ann_symbols`. Signal is gone.
+- **Offline eval (Week 1-2):** scoring runs over cached windows — no raw signal needed.
+- **Load-gen replay (Week 2):** load-gen pods pre-window their assigned records once at startup, then emit pre-windowed beat messages onto Redis at the requested playback speed. Raw signal is discarded after windowing.
+- **Online serving (Week 2+):** Gateway and worker pods receive pre-windowed beat messages over Redis. They never call `load_record` — the server side never touches on-disk data at all. That's what makes the serving topology stateless.
+
+### Float64 → float32 cast happens at window extraction, not at load
+
+Rationale from `dataset.md` §7:
+- wfdb returns float64 natively; casting at `load_record` time would force a redundant 10 MB copy for no immediate benefit.
+- Float32 savings matter most at the **transport boundary** (Redis message bandwidth: ~22 MB/s vs ~44 MB/s at 22k msg/sec).
+- Z-score mean/std is computed in float64 for negligible-but-free precision, then the normalised window is cast to float32 for transport.
+
+So the architectural rule: **float64 for compute, float32 for transport.** The cast lives in `pulsegate_core.windowing` (step 4), not `pulsegate_core.io` (step 2).

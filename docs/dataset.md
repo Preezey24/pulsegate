@@ -38,8 +38,23 @@ Three companion files per record (each `.dat` requires its `.hea`; `.atr` carrie
 | `.atr` | Binary | Annotations: list of `(sample_index, symbol)` pairs |
 
 - **Reader library:** `wfdb` (Python).
-- **In-memory shape:** `record.p_signal` is `(N, 2)` float64 array where N ≈ 650,000.
-- **Annotation object:** `wfdb.rdann` returns parallel arrays `annotation.sample` (int sample indices) and `annotation.symbol` (single-char strings).
+- **Raw wfdb objects:** `wfdb.rdrecord` returns a `Record` whose `.p_signal` is an `(N, 2)` float64 array (N ≈ 650,000), with lists for `sig_name` and `units`. `wfdb.rdann` returns a separate `Annotation` whose `.sample` and `.symbol` are parallel arrays (int indices + single-char strings).
+
+### In-memory representation (`pulsegate_core.io.Record`)
+
+Frozen dataclass that consolidates both wfdb objects into a single immutable container, normalises types (lists → tuples, pinned `int64` for sample indices), and adds the `record_id`. This is what the rest of the codebase consumes — no module touches raw `wfdb` objects directly.
+
+| Field | Type | Example | Meaning |
+|---|---|---|---|
+| `record_id` | `str` | `"100"` | MIT-BIH record identifier (e.g. `"100"`, `"203"`) |
+| `fs` | `int` | `360` | Sampling frequency in Hz |
+| `signal` | `np.ndarray (N, n_channels)` float64 | shape `(650000, 2)` | Raw voltage in mV. Row = time step, column = lead |
+| `sig_name` | `tuple[str, ...]` | `("MLII", "V5")` | Lead names per channel. **Select by name, not index** (§10 gotcha) |
+| `units` | `tuple[str, ...]` | `("mV", "mV")` | Voltage units per channel — always mV for MIT-BIH |
+| `ann_samples` | `np.ndarray` int64 | `[18, 77, 370, …]` | Sample indices where each annotation occurs |
+| `ann_symbols` | `tuple[str, ...]` | `("+", "N", "N", …)` | Annotation symbols, parallel to `ann_samples` — **mix of beat and non-beat symbols, filter before windowing** (§5, §10) |
+
+**Why the wrapper:** single stable internal type insulates the codebase from wfdb API drift; immutability (`frozen=True` + tuples) prevents accidental mutation of loaded records across modules; pinned int64 guarantees predictable arithmetic downstream (R-R interval calcs in §8).
 
 ## 4. Annotations
 
