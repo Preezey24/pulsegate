@@ -782,3 +782,63 @@ Rationale from `dataset.md` §7:
 - Z-score mean/std is computed in float64 for negligible-but-free precision, then the normalised window is cast to float32 for transport.
 
 So the architectural rule: **float64 for compute, float32 for transport.** The cast lives in `pulsegate_core.windowing` (step 4), not `pulsegate_core.io` (step 2).
+
+## 12. RandomForest baseline — why, how, and when we upgrade
+
+Week 1 classifier is `sklearn.ensemble.RandomForestClassifier` operating on the 256-dim flat feature vector from `pulsegate_core.features` (252 z-scored window samples + 4 Chazal R-R scalars per beat). This section documents the rationale so the Week 3 CNN upgrade has a clearly-justified baseline to beat.
+
+### Why RandomForest (not a CNN) for V1
+
+Five reasons, all load-bearing:
+
+1. **Scale-invariant.** Tree models split column-at-a-time and don't care about units — our 256-column vector mixes z-scored voltage samples (~float32 near 0) with R-R intervals (seconds, ~0.5-1.2). No normalisation needed; raw concatenation works.
+2. **Handles class imbalance via `class_weight='balanced'`.** MIT-BIH is ~80% N-class (`dataset.md` §5); naive accuracy would let "always predict N" score 80% while being clinically useless. Balanced weighting makes splits reward rare-class separation — essential for per-class F1 (see §3).
+3. **Fast on our data size.** ~45k training beats × 256 features × 100 trees = a few seconds on a laptop. No GPU, no infrastructure. Fast iteration matters in Week 1.
+4. **Interpretable.** `model.feature_importances_` tells us which of the 256 columns actually earned their keep — whether the model relies on morphology (window columns) or timing (temporal columns), which window regions matter (R-peak, T-wave). Diagnostic tool when the model underperforms.
+5. **Strong baseline to beat.** Chazal-style features + RF typically lands 80-90% macro-F1 on MIT-BIH. Week 3's CNN has to clear this bar meaningfully to justify the architectural jump.
+
+### How RandomForest works, applied to our data
+
+100 decision trees, each deliberately crippled differently:
+
+- **Bagging (row sampling):** each tree sees a bootstrap sample of ~45k beats drawn with replacement from the training set. Different trees see different slices, producing uncorrelated errors.
+- **Random feature subsampling (column sampling):** at every split, the tree considers only `max_features=sqrt(256) ≈ 16` randomly-chosen columns. No single "favorite" column dominates every tree; trees specialise.
+- **Greedy Gini splits.** Each split picks the `(column, threshold)` pair that most reduces label mixing in the children. Trees grow until leaves are pure or depth caps kick in.
+- **Voting.** At prediction time, all 100 trees classify the beat; majority class wins (or averaged probabilities via `predict_proba`).
+
+Individual trees overfit; the forest doesn't — their mistakes cancel in the vote.
+
+### Hyperparameters V1 will use
+
+| Parameter | Value | Rationale |
+|---|---|---|
+| `n_estimators` | 100 | Standard default; diminishing returns past ~200 for this data size. |
+| `class_weight` | `'balanced'` | Reweights classes inversely to frequency. Non-negotiable for per-class F1. |
+| `max_features` | `'sqrt'` | sqrt(256) ≈ 16 columns per split. RF default. |
+| `max_depth` | `None` | Trees grow to purity; overfitting is controlled by bagging, not depth caps. |
+| `random_state` | `42` | Reproducibility — identical training runs produce identical models. |
+
+### Expected feature-importance pattern (for post-training analysis)
+
+- **Temporal columns 252-255:** `rr_ratio` (col 255) should dominate — clearest prematurity signal for V/S-class detection.
+- **Window columns ~85-95:** R-peak region. V-class beats differ from N in peak height/width here.
+- **Window columns ~170-220:** T-wave region. F and V differ from N in repolarisation morphology here.
+- **Window columns 0-40 and 240-251:** low importance. Iso-electric baseline after z-score carries little class-differentiating signal.
+
+If the trained model shows a wildly different pattern (e.g. ignoring R-peak region), that's a signal something's wrong with the preprocessing pipeline, not the model.
+
+### Limitations — why Week 3 upgrades to 1D-CNN
+
+RF treats the 256 columns as **unordered, independent features**. It has no notion that columns 0-251 form a **time-ordered waveform** with local correlation between adjacent samples. Consequences:
+
+- RF can't learn translation-invariant shape features (e.g. "a tall spike anywhere in a 40-sample window around R-peak is a V signal"). Each window position has to be learned separately.
+- RF can't compose hierarchical features (local shapes → mid-level patterns → full beat morphology). Each split sees one column in isolation.
+- Capacity saturates — past ~200 trees, additional ensemble size gives negligible gain.
+
+A **1D-CNN** respects time-order via convolution kernels that slide along the window, learning shape features invariant to exact position. Week 3's two-branch architecture (CNN on the 252-sample window, MLP on the 4 scalars, concatenate before the final classifier head) is a fundamentally different representation of the input, not a tuning of the same representation.
+
+**Target for Week 3:** +5-10% macro-F1 over the RF baseline on DS2. If the CNN doesn't clear that margin, the RF baseline stays in production — extra complexity has to earn its seat.
+
+### Why the baseline matters for the portfolio narrative
+
+Shipping the RF baseline first, then upgrading to CNN, mirrors the prior-platform discipline: *"prove the pipeline works end-to-end with the simplest model, then swap in a better model behind the same interface."* The FastAPI `/classify` endpoint, the stream message shape, the golden-dataset eval harness — all of these should remain stable across the RF→CNN swap. That's the SLM-wrapper pattern applied to biosignals.
