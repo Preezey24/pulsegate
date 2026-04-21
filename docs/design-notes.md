@@ -315,6 +315,34 @@ The script builds (or assumes pre-built) a `pulsegate-loadgen` image, renders a 
 - V1: single Job, configured by env vars, one bash script to launch it. No operator, no CRD, no autoscaling.
 - Stretch: HPA on consumer queue depth; separate load-shape profiles (spike, ramp, sustained).
 
+### Producer coroutine multiplexing — one coroutine, many patients
+
+Each virtual-patient coroutine is **idle ~95% of wall-clock time**: a 50 ms classification round-trip inside a ~1000 ms R-R interval leaves the majority of each cycle sitting in `asyncio.sleep(until next R-peak)`. At the 22k msg/sec target with 2,200 virtual patients, naively running 2,200 coroutines wastes scheduler state and producer-pod count.
+
+A single coroutine can **multiplex M patients** without changing the system's external behaviour. Each iteration picks the patient whose next beat is due soonest, awaits that time, sends the beat, awaits the classification, advances that patient's state, loops.
+
+```python
+async def multi_patient_producer(patients: list[VirtualPatient]):
+    while True:
+        patient = min(patients, key=lambda p: p.next_beat_time)
+        await sleep_until(patient.next_beat_time)
+        result = await send_beat(patient.next_beat())
+        patient.advance(result)
+```
+
+**Natural limit on M:** if round-trip is T ms and patients emit at ~1 beat/sec each, one coroutine can serve at most ~(1000 / T) patients before classification time eats into the R-R budget and beats start queueing. At T = 50 ms that's ~20 patients/coroutine — in practice we'd pick M = 5-10 to leave slack for occasional latency spikes.
+
+**Benefits:**
+- ~10× reduction in producer-pod count at the 22k msg/sec target (2,200 patients → ~220-440 coroutines → ~3-5 pods instead of ~20).
+- Makes the cost of coroutine underutilisation a tuning dial rather than an implicit over-provision.
+- Fewer TCP connections to the Gateway — each coroutine reuses its connection across its pool of patients.
+
+**Trade-off:**
+- Within one coroutine, patients are serialised. A single slow classification delays the other M-1 patients in that coroutine. Keeping M small bounds the blast radius; per-patient round-trip metrics tagged with `virtual_patient_id` surface the issue if it happens.
+- Harder to debug when one slow patient affects coroutine-peers — but observability catches it regardless.
+
+**V1 / Week 2 approach:** ship with M = 1 (one patient per coroutine) for implementation simplicity. Week 2 load test measures whether multiplexing produces meaningful pod-count reduction at our target; if so, bump M and re-measure. The rest of the system doesn't care how many patients live in each coroutine — this is strictly a producer-side optimisation.
+
 ---
 
 ## 8. Production serving topology — layered ingress, per-type Redis stream pairs
@@ -497,6 +525,25 @@ Caller's HTTP connection must land on a specific Gateway pod — that's the pod 
 | **Worker crashes mid-processing** | Message pulled from `:in` but not ACKed | Redis consumer group marks "pending". After `min-idle-time`, another consumer claims via `XCLAIM`, processes, ACKs. If Gateway still waiting, future resolves (slow but successful). If Gateway already timed out, falls into the caller-disconnect case. |
 | **Gateway pod crashes** | In-memory `pending` map lost with the pod | Caller sees TCP reset. Worker still processes. Response orphaned — other Gateway pods see it on `:out` but find no matching `pending` entry. **Mitigation: sticky Ingress routing in V1**; persistent correlation state in Redis for V2. |
 | **Permanently-failing message** | Worker crashes every time on one input (malformed payload) | Retry count tracked per message. After N retries, worker moves it to `ecg:dlq` (Dead Letter Queue) and ACKs the original. Reaper / human inspects DLQ. Prometheus alert on DLQ size. V1: defer. Stretch: implement. |
+
+### Gateway-side buffering for transient latency spikes
+
+In steady state (healthy workers, normal R-R intervals), the Gateway holds at most **one pending Future per virtual patient** — the HTTP round-trip completes well before the next R-peak fires, so the pending dict stays tiny. But transient worker slowness, GC pauses, or network hiccups can push round-trip above the R-R interval temporarily, at which point the **device** would otherwise have to buffer the next beat locally until the previous one is acknowledged. That pushes complexity to clients that may have minimal local resources (wearables, battery-constrained monitors).
+
+The Gateway can absorb these transient spikes so devices never need a local buffer. Two ways to relax the current one-in-flight-per-patient assumption:
+
+**1. Grow the per-patient pending-Future capacity.** Today we implicitly assume one outstanding request per patient. Relaxing to N-in-flight (say, N = 5) lets the Gateway accept up to 5 concurrent POSTs for the same patient without blocking the device. The Futures resolve in whatever order workers finish; the `request_id` correlation layer already handles out-of-order completion cleanly.
+- Cost: modestly more memory for pending Futures (N × patients × ~1 KB each = trivial at portfolio scale).
+- Client complexity: device tracks multiple in-flight requests, matches responses by `request_id` (same mechanism the Gateway already uses internally).
+- Failure behaviour: if the Gateway pod crashes, up to N unresolved requests per patient are lost — worse than the 1-in-flight case by a factor of N, still bounded.
+
+**2. Async-callback delivery.** Gateway accepts POST, XADDs to Redis, immediately acks the device (not with the classification, just with "received + request_id"). Classifications are delivered asynchronously via a callback URL, websocket, or a separate results-polling endpoint. This fully decouples producer emission rate from classification latency.
+- Cost: more complex client protocol, lost-result recovery (what happens if the callback fails?), no implicit latency-driven backpressure (the device no longer feels the system slowing down).
+- More substantial redesign — we'd undertake it only if option 1 proves insufficient.
+
+**V1 decision:** keep the synchronous one-in-flight-per-patient model. The round-trip vs R-R interval math strongly favours it and the code is dead simple. Option 1 is a config-flag-level change we can flip if operational monitoring reveals device-side buffering is becoming a real issue. Option 2 is reserved for a later design revisit.
+
+**Invariant either way:** transient latency spikes are **absorbed by the Gateway**, never pushed to devices. The Gateway is where the buffering complexity lives by design — it's the pod type that's easiest to scale, easiest to operate, and has the most memory to spare.
 
 ### Future-proofing for new signal types
 
