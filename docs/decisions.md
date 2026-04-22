@@ -50,5 +50,40 @@ Retrain on all 22 DS1 records. Drop the internal val split entirely. Evaluate on
 - For small imbalanced datasets, the "always hold out an internal val set" convention can cost more than it buys. Check the assumption against the dataset's actual shape.
 
 ### Related
-- `design-notes.md` §12 — RandomForest baseline rationale (claim of 80-90% macro-F1 was from the literature; actual number for our setup likely 55-70% and heavily gated by minority-class F1).
+- `design-notes.md` §12 — RandomForest baseline rationale (claim of 80-90% macro-F1 was from the literature; actual number for our setup is 0.369 on DS2, see post-Step C results below).
 - `dataset.md` §5 — AAMI class distribution; makes the imbalance visible but doesn't predict the starvation pattern.
+
+### Post-Step C results (baseline v1 on DS2)
+
+Retrained model evaluated against all 22 DS2 records. Full report in `eval/baseline_v0.json`.
+
+| Metric | Value |
+|---|---|
+| macro F1 | **0.369** |
+| weighted F1 | 0.916 |
+| accuracy | 0.937 |
+| N-class F1 | 0.966 |
+| V-class F1 | 0.860 |
+| S-class F1 | 0.019 |
+| F-class F1 | 0.000 |
+| Q-class F1 | 0.000 |
+
+**What changed vs v0 (held-out DS1 val):**
+- Retrained model now includes Q in its output vocabulary (was structurally excluded before).
+- S-class F1 moved from exactly 0 to 0.019 — model attempts S predictions but catches only 18 of 1,837 true S beats. Most S beats still classified as N (1,794 / 1,837 = 98%).
+- F and Q still at 0 F1 — extreme imbalance + morphological ambiguity (F is a hybrid of N and V; Q has only 7 samples in DS2).
+
+**What the confusion matrix reveals:** the dominant failure mode is *"ambiguous beats default to N."* RandomForest's split-gain + majority-vote mechanic structurally biases toward the dominant class on extreme imbalance, even with `class_weight='balanced'`.
+
+**Per-record F1 spread: 0.074 (record 232) to 0.460 (record 100).** Record 232 is the A-dominant one (78% atrial premature per `dataset.md` §5) — the class the model can't detect. The 6× spread confirms the failure is patient-distribution-dependent, not random: records with mostly normal rhythm score well, records with rare-class arrhythmia score catastrophically.
+
+**Literature comparison:** RF + Chazal-style features typically lands 0.50–0.65 macro-F1 on DS2. Our 0.369 is below that range. Plausible causes:
+- Raw window samples as features (vs. literature's wavelet/PCA morphology features).
+- `class_weight='balanced'` has real limits on 90%+ majority-class imbalance.
+- RandomForest is structurally poor at translation-invariant morphology learning.
+
+The weak baseline is actually **valuable for the portfolio narrative**: it makes the CNN's expected contribution in Week 3 measurable and meaningful. A pre-tuned baseline at 0.55 would compress the upgrade story.
+
+### Decision on v0 baseline
+
+Accept `eval/baseline_v0.json` as the recorded baseline and move to Week 2. Further RF tuning (SMOTE, `balanced_subsample`, feature engineering) is left for the stretch-goal list — the Week 3 CNN is the architected response to these failures, not baseline-tuning.
