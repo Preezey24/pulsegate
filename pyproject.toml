@@ -6,6 +6,7 @@ requires-python = ">=3.12"
 dependencies = [
     "matplotlib>=3.10.8",
     "numpy>=2.4.4",
+    "redis>=5.0",
     "scikit-learn>=1.5",
     "wfdb>=4.3.1",
 ]

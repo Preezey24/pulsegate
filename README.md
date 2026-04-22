@@ -23,8 +23,33 @@ The data download is idempotent — re-running verifies the dataset is complete 
 
 Integration tests require the MIT-BIH data to be present at `data/mitdb/`. Unit tests run standalone.
 
+## Running Redis (Week 2+)
+
+The streaming pipeline requires Redis 7+ running locally. Docker Compose manages it:
+
+```bash
+# Start Redis in the background (data persists across restarts via a named volume)
+docker compose up -d
+
+# Verify it's up
+docker compose ps
+redis-cli ping                # → PONG
+
+# Tail logs
+docker compose logs -f redis
+
+# Stop Redis (data preserved)
+docker compose down
+
+# Stop Redis AND wipe all data (fresh state)
+docker compose down -v
+```
+
+Redis binds to `127.0.0.1:6379` (localhost only) with AOF persistence enabled per `design-notes.md` §8. The producer script (`scripts/run_producer.py`) defaults to this URL — no config needed.
+
 ## Docs
 
 - [`docs/dataset.md`](docs/dataset.md) — dataset schema, labels, AAMI mapping, gotchas.
 - [`docs/architecture.md`](docs/architecture.md) — system architecture.
 - [`docs/design-notes.md`](docs/design-notes.md) — running decisions log.
+- [`docs/decisions.md`](docs/decisions.md) — architectural decision log with rationale.
