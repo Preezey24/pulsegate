@@ -19,7 +19,7 @@ build-backend = "hatchling.build"
 packages = ["src/pulsegate_core"]
 
 [dependency-groups]
-dev = ["pytest>=8.0"]
+dev = ["pytest>=8.0", "fakeredis>=2.20"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
