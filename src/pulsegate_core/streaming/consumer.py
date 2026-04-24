@@ -15,6 +15,12 @@ from typing import Any
 import numpy as np
 import redis
 
+from pulsegate_core.streaming.metrics import (
+    consumer_beats_consumed_total,
+    consumer_decode_duration_seconds,
+    consumer_predict_duration_seconds,
+    consumer_process_latency_seconds,
+)
 from pulsegate_core.streaming.producer import ECG_BEAT_STREAM
 
 ECG_BEAT_OUT_STREAM = "ecg_beat:out"
@@ -55,23 +61,31 @@ class BeatConsumer:
         msg_id, fields = messages[0]
 
         msg = {k.decode(): v.decode() for k, v in fields.items()}
-        samples = np.array(json.loads(msg["samples"]), dtype=np.float32)
-        temporal = np.array(
-            [0.0 if msg[k] == "null" else float(msg[k]) for k in _TEMPORAL_KEYS],
-            dtype=np.float32,
-        )
-        features = np.concatenate([samples, temporal]).reshape(1, -1)
-        pred = self.model.predict(features)[0]
-        probs = self.model.predict_proba(features)[0]
-        confidence = float(probs[list(self.model.classes_).index(pred)])
 
+        with consumer_decode_duration_seconds.time():
+            samples = np.array(json.loads(msg["samples"]), dtype=np.float32)
+            temporal = np.array(
+                [0.0 if msg[k] == "null" else float(msg[k]) for k in _TEMPORAL_KEYS],
+                dtype=np.float32,
+            )
+            features = np.concatenate([samples, temporal]).reshape(1, -1)
+
+        with consumer_predict_duration_seconds.time():
+            pred = self.model.predict(features)[0]
+            probs = self.model.predict_proba(features)[0]
+            confidence = float(probs[list(self.model.classes_).index(pred)])
+
+        consumer_ts = time.time()
         result = {k: msg[k] for k in _PASS_THROUGH_KEYS}
         result.update({
             "signal_type": "ecg_beat",
             "predicted_class": str(pred),
             "confidence": str(confidence),
-            "consumer_ts": str(time.time()),
+            "consumer_ts": str(consumer_ts),
         })
         self.client.xadd(self.out_stream, result)
         self.client.xack(self.in_stream, self.group_name, msg_id)
+
+        consumer_beats_consumed_total.labels(predicted_class=str(pred)).inc()
+        consumer_process_latency_seconds.observe(consumer_ts - float(msg["producer_ts"]))
         return result

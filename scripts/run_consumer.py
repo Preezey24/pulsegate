@@ -16,6 +16,7 @@ from pathlib import Path
 
 import joblib
 import redis
+from prometheus_client import start_http_server
 
 from pulsegate_core.streaming import BeatConsumer
 
@@ -25,6 +26,8 @@ MODEL_PATH = Path("models/baseline.joblib")
 def main() -> None:
     ap = argparse.ArgumentParser(description="Run a pulsegate beat-classifier worker.")
     ap.add_argument("--redis-url", default="redis://localhost:6379", help="Redis connection URL")
+    ap.add_argument("--metrics-port", type=int, default=9092,
+                    help="Port to expose Prometheus /metrics on (default: 9092)")
     args = ap.parse_args()
 
     if not MODEL_PATH.exists():
@@ -39,6 +42,8 @@ def main() -> None:
     consumer = BeatConsumer(client=client, model=model)
     consumer.ensure_group()
 
+    start_http_server(args.metrics_port)
+    print(f"Prometheus metrics: http://localhost:{args.metrics_port}/metrics")
     print(f"Consumer {consumer.consumer_name} listening on {consumer.in_stream} → {consumer.out_stream}")
     print(f"Model trained {artifact['trained_at']}, classes {list(model.classes_)}")
 
