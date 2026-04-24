@@ -17,6 +17,7 @@ import argparse
 import time
 
 import redis
+from prometheus_client import start_http_server
 
 from pulsegate_core.pipeline import iter_beats
 from pulsegate_core.streaming import BeatProducer
@@ -31,12 +32,16 @@ def main() -> None:
                     help="Redis connection URL")
     ap.add_argument("--max-beats", type=int, default=None,
                     help="Stop after N beats (default: whole record)")
+    ap.add_argument("--metrics-port", type=int, default=9091,
+                    help="Port to expose Prometheus /metrics on (default: 9091)")
     args = ap.parse_args()
 
     client = redis.from_url(args.redis_url)
     client.ping()  # fail fast if Redis is unreachable
     producer = BeatProducer(client=client)
 
+    start_http_server(args.metrics_port)
+    print(f"Prometheus metrics: http://localhost:{args.metrics_port}/metrics")
     print(f"Replaying record {args.record_id} at speed={args.speed}x → {args.redis_url}")
     t_start = time.perf_counter()
     n_emitted = 0
