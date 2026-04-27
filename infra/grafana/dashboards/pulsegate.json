@@ -1,0 +1,65 @@
+{
+  "title": "pulsegate",
+  "uid": "pulsegate",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "5s",
+  "time": {"from": "now-5m", "to": "now"},
+  "timezone": "browser",
+  "panels": [
+    {
+      "id": 1,
+      "title": "Throughput (msg/sec)",
+      "type": "timeseries",
+      "gridPos": {"x": 0, "y": 0, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "interval": "5s",
+      "targets": [
+        {"expr": "sum(rate(pulsegate_producer_beats_emitted_total{job=\"pulsegate-producer\"}[30s]))", "legendFormat": "producer emit"},
+        {"expr": "sum(rate(pulsegate_consumer_beats_consumed_total{job=\"pulsegate-consumer\"}[30s]))", "legendFormat": "consumer consume"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "short", "min": 0}, "overrides": []}
+    },
+    {
+      "id": 2,
+      "title": "Process latency quantiles (seconds)",
+      "type": "timeseries",
+      "gridPos": {"x": 12, "y": 0, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "interval": "5s",
+      "targets": [
+        {"expr": "histogram_quantile(0.50, sum by (le) (rate(pulsegate_consumer_process_latency_seconds_bucket{job=\"pulsegate-consumer\"}[1m])))", "legendFormat": "p50"},
+        {"expr": "histogram_quantile(0.95, sum by (le) (rate(pulsegate_consumer_process_latency_seconds_bucket{job=\"pulsegate-consumer\"}[1m])))", "legendFormat": "p95"},
+        {"expr": "histogram_quantile(0.99, sum by (le) (rate(pulsegate_consumer_process_latency_seconds_bucket{job=\"pulsegate-consumer\"}[1m])))", "legendFormat": "p99"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "s", "min": 0}, "overrides": []}
+    },
+    {
+      "id": 3,
+      "title": "Consumer per-phase mean time (ms)",
+      "type": "timeseries",
+      "gridPos": {"x": 0, "y": 8, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "interval": "5s",
+      "targets": [
+        {"expr": "1000 * rate(pulsegate_consumer_predict_duration_seconds_sum{job=\"pulsegate-consumer\"}[30s]) / clamp_min(rate(pulsegate_consumer_predict_duration_seconds_count{job=\"pulsegate-consumer\"}[30s]), 1e-9)", "legendFormat": "predict"},
+        {"expr": "1000 * rate(pulsegate_consumer_decode_duration_seconds_sum{job=\"pulsegate-consumer\"}[30s]) / clamp_min(rate(pulsegate_consumer_decode_duration_seconds_count{job=\"pulsegate-consumer\"}[30s]), 1e-9)", "legendFormat": "decode"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "ms", "min": 0}, "overrides": []}
+    },
+    {
+      "id": 4,
+      "title": "Queue state (length / lag / PEL)",
+      "type": "timeseries",
+      "gridPos": {"x": 12, "y": 8, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "interval": "5s",
+      "targets": [
+        {"expr": "pulsegate_stream_length{job=\"pulsegate-stream-monitor\"}", "legendFormat": "length {{stream}}"},
+        {"expr": "pulsegate_stream_lag{job=\"pulsegate-stream-monitor\"}", "legendFormat": "lag {{group}} on {{stream}}"},
+        {"expr": "pulsegate_stream_pending{job=\"pulsegate-stream-monitor\"}", "legendFormat": "pending {{group}} on {{stream}}"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "short", "min": 0}, "overrides": []}
+    }
+  ]
+}

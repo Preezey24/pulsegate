@@ -47,6 +47,28 @@ docker compose down -v
 
 Redis binds to `127.0.0.1:6379` (localhost only) with AOF persistence enabled per `design-notes.md` §8. The producer script (`scripts/run_producer.py`) defaults to this URL — no config needed.
 
+## Observability (Week 2+)
+
+The streaming pipeline exposes Prometheus metrics:
+- Producer `/metrics` on `localhost:9091`
+- Consumer `/metrics` on `localhost:9092`
+- Stream monitor `/metrics` on `localhost:9093`
+
+`docker compose up -d` starts Prometheus (scrapes every 5s) and Grafana alongside Redis. Once the pipeline scripts are running, the pre-provisioned dashboard shows throughput, latency quantiles, per-phase timing breakdowns, and queue state:
+
+```bash
+# Start infra + producer/consumer/monitor (in separate terminals)
+docker compose up -d
+uv run python scripts/run_consumer.py
+uv run python scripts/run_producer.py 100 --speed 100 --max-beats 500
+uv run python scripts/run_stream_monitor.py
+
+# Open the dashboard
+open http://localhost:3000/d/pulsegate
+```
+
+Grafana is anonymous-access enabled (Viewer role) for local dev — no login needed.
+
 ## Docs
 
 - [`docs/dataset.md`](docs/dataset.md) — dataset schema, labels, AAMI mapping, gotchas.

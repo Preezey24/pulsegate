@@ -10,9 +10,13 @@ from __future__ import annotations
 
 from prometheus_client import Counter, Gauge, Histogram
 
-# Latency/duration histogram buckets (seconds), tuned for the 1-200ms target range.
-# Revisit after Step 4 load test if p50/p95/p99 fall in too few adjacent buckets.
-_LATENCY_BUCKETS = (0.001, 0.002, 0.005, 0.010, 0.020, 0.050, 0.100, 0.200, 0.500, 1.0, 2.0, 5.0)
+# Latency/duration histogram buckets (seconds). Low-end fine-grained for predict (~26ms)
+# and decode (<1ms); high-end extended to 60s to capture queue-wait under backpressure
+# (load tests reach ~30s+ end-to-end when producer outruns consumer).
+_LATENCY_BUCKETS = (
+    0.001, 0.002, 0.005, 0.010, 0.020, 0.050, 0.100, 0.200, 0.500,
+    1.0, 2.0, 5.0, 10.0, 20.0, 30.0, 60.0,
+)
 
 
 # --- Producer-side ---
@@ -65,5 +69,11 @@ stream_length = Gauge(
 stream_pending = Gauge(
     "pulsegate_stream_pending",
     "Number of messages in a consumer group's Pending Entries List (PEL).",
+    ("stream", "group"),
+)
+stream_lag = Gauge(
+    "pulsegate_stream_lag",
+    "Messages written to the stream but not yet delivered to any consumer in the group "
+    "(true backlog; PEL is in-flight, not waiting). Requires Redis 7+.",
     ("stream", "group"),
 )

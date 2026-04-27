@@ -1,0 +1,19 @@
+global:
+  scrape_interval: 5s
+  evaluation_interval: 15s
+
+scrape_configs:
+  # Producer pod — exposes /metrics on host:9091 (start with: uv run python scripts/run_producer.py)
+  - job_name: 'pulsegate-producer'
+    static_configs:
+      - targets: ['host.docker.internal:9091']
+
+  # Consumer pod — exposes /metrics on host:9092 (start with: uv run python scripts/run_consumer.py)
+  - job_name: 'pulsegate-consumer'
+    static_configs:
+      - targets: ['host.docker.internal:9092']
+
+  # Stream monitor — exposes /metrics on host:9093 (start with: uv run python scripts/run_stream_monitor.py)
+  - job_name: 'pulsegate-stream-monitor'
+    static_configs:
+      - targets: ['host.docker.internal:9093']
